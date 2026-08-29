@@ -1,0 +1,47 @@
+{
+  "name": "dsh-token-stats-xg",
+  "version": "1.2.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH plugin: cross-session token usage monitoring (input/output/cache) with live session/event listener, durable state, a token_stats query tool, a Web dashboard tab (conversation.view), and cost estimation (DeepSeek official idle-time pricing + local electricity).",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/logic.js",
+    "lib/client.js",
+    "lib/types/**/*.d.ts"
+  ],
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:host": "tsc -p tsconfig.json",
+    "prepare": "node scripts/build.mjs",
+    "test": "node --test tests/logic.spec.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-session": "*",
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-session": "*",
+    "@deepseek-ai/dsh-tools": "*",
+    "typescript": "^5"
+  }
+}
