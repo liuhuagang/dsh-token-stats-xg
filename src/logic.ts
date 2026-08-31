@@ -56,6 +56,8 @@ export interface DayAgg {
 export interface StoredSession {
   cwd?: string
   agentPreset?: string
+  /** 会话标题（session/title 事件折叠所得；无标题事件时为 undefined） */
+  title?: string
   createdAt: number
   /** 有 usage 样本的步骤数（= 报告过 token 的模型请求数） */
   requests: number
@@ -74,6 +76,8 @@ export interface TokenStatsState {
 /** 折叠过程中的单会话可变状态（last 槽位与 route 只在内存，不落盘） */
 export interface SessionFold {
   meta: { cwd?: string; agentPreset?: string; createdAt: number }
+  /** 会话标题（session/title 事件折叠所得；无标题事件时为 undefined） */
+  title?: string
   requests: number
   totals: UsageBuckets
   lastActivity: number
@@ -426,6 +430,7 @@ export function foldToStored(fold: SessionFold): StoredSession {
   return {
     ...fold.meta.cwd === undefined ? {} : { cwd: fold.meta.cwd },
     ...fold.meta.agentPreset === undefined ? {} : { agentPreset: fold.meta.agentPreset },
+    ...fold.title === undefined ? {} : { title: fold.title },
     createdAt: fold.meta.createdAt,
     requests: fold.requests,
     totals: fold.totals,
@@ -493,6 +498,19 @@ export function routeFromEvent(event: FoldableEvent): RouteKey | null {
     if (isRoutePair(config)) return { provider: config.provider, model: config.model }
   }
   return null
+}
+
+/**
+ * 从一条 session/title 事件提取会话标题（去空白）；非标题事件返回 undefined。
+ * 与 DSH 标题投影一致：最新事件胜出（调用方按日志顺序应用）。
+ */
+export function titleFromEvent(event: FoldableEvent): string | undefined {
+  const data = event.data
+  if (typeof data !== 'object' || data === null) return undefined
+  const d = data as Record<string, unknown>
+  if (event.type !== 'session/title') return undefined
+  const title = d['title']
+  return typeof title === 'string' && title.trim().length > 0 ? title.trim() : undefined
 }
 
 // ---------- 状态持久化 ----------
@@ -575,6 +593,7 @@ export function sanitizeStoredSession(value: unknown): StoredSession | null {
   return {
     ...typeof v['cwd'] === 'string' ? { cwd: v['cwd'] } : {},
     ...typeof v['agentPreset'] === 'string' ? { agentPreset: v['agentPreset'] } : {},
+    ...typeof v['title'] === 'string' && v['title'].length > 0 ? { title: v['title'] } : {},
     createdAt: isFiniteNumber(v['createdAt']) ? v['createdAt'] : 0,
     requests: isFiniteNumber(v['requests']) && v['requests'] >= 0 ? v['requests'] : 0,
     totals,
@@ -596,10 +615,14 @@ export function saveState(file: string, state: TokenStatsState): void {
 export interface RecentCommitRow extends RecentCommit {
   routeLabel: string
   totalTokens: number
+  /** 会话标题（从状态解析；无标题事件时省略） */
+  title?: string
 }
 
 export interface SessionReportRow {
   sessionId: string
+  /** 会话标题（无标题事件时省略） */
+  title?: string
   cwd?: string
   agentPreset?: string
   requests: number
@@ -747,6 +770,7 @@ export function buildReport(state: TokenStatsState, opts: ReportOptions): StatsR
     totalUsage = addUsage(totalUsage, usage)
     sessionRows.push({
       sessionId: id,
+      ...session.title === undefined ? {} : { title: session.title },
       ...session.cwd === undefined ? {} : { cwd: session.cwd },
       ...session.agentPreset === undefined ? {} : { agentPreset: session.agentPreset },
       requests,
@@ -812,7 +836,15 @@ export function buildReport(state: TokenStatsState, opts: ReportOptions): StatsR
     .filter(c => c.time >= windowStartMs && matches(c.sessionId))
     .sort((a, b) => b.time - a.time)
     .slice(0, recentLimit)
-    .map(c => ({ ...c, routeLabel: routeLabel(c.route), totalTokens: totalTokens(c.usage) }))
+    .map(c => {
+      const title = state.sessions[c.sessionId]?.title
+      return {
+        ...c,
+        routeLabel: routeLabel(c.route),
+        totalTokens: totalTokens(c.usage),
+        ...title === undefined ? {} : { title },
+      }
+    })
 
   return {
     generatedAt: opts.now,
@@ -846,6 +878,11 @@ const fmtDateTime = (ts: number): string => {
   const d = new Date(ts)
   const pad = (n: number): string => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+/** 会话显示标签：有标题时 "标题（短id）"，否则仅短 id（提升可读性） */
+export function sessionLabel(title: string | undefined, shortId: string): string {
+  return title === undefined || title.length === 0 ? shortId : `${title}（${shortId}）`
 }
 
 /** 渲染报告为模型可见的中文摘要文本 */
@@ -895,9 +932,10 @@ export function renderReport(report: StatsReport): string {
     lines.push('', `按会话（TOP ${report.bySession.length}）：`)
     for (const row of report.bySession) {
       const shortId = row.sessionId.length > 19 ? `${row.sessionId.slice(0, 19)}…` : row.sessionId
+      const label = sessionLabel(row.title, shortId)
       const cwd = row.cwd === undefined ? '' : `  ${row.cwd}`
       lines.push(
-        `  ${shortId}${cwd}  调用 ${fmtInt(row.requests)}  输入 ${fmtInt(row.usage.inputTokens + row.usage.cacheReadTokens + row.usage.cacheWriteTokens)}`
+        `  ${label}${cwd}  调用 ${fmtInt(row.requests)}  输入 ${fmtInt(row.usage.inputTokens + row.usage.cacheReadTokens + row.usage.cacheWriteTokens)}`
         + `  输出 ${fmtInt(row.usage.outputTokens)}  合计 ${fmtInt(row.totalTokens)}  最近 ${fmtDateTime(row.lastActivity)}`,
       )
     }
@@ -908,7 +946,7 @@ export function renderReport(report: StatsReport): string {
     for (const row of report.recent) {
       const u2 = row.usage
       lines.push(
-        `  ${fmtTime(row.time)}  ${row.sessionId.slice(0, 19)}  ${row.routeLabel}`
+        `  ${fmtTime(row.time)}  ${sessionLabel(row.title, row.sessionId.slice(0, 19))}  ${row.routeLabel}`
         + `  输入 ${fmtInt(u2.inputTokens + u2.cacheReadTokens + u2.cacheWriteTokens)}  输出 ${fmtInt(u2.outputTokens)}  [${row.source}]`,
       )
     }

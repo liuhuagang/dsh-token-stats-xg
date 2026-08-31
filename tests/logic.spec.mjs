@@ -30,6 +30,7 @@ import {
   sampleFromEvent,
   saveState,
   stateFilePath,
+  titleFromEvent,
   totalTokens,
   usageEqual,
   zeroCost,
@@ -96,6 +97,13 @@ test('dayKey：本地日期键', () => {
 test('routeLabel：null → unknown', () => {
   assert.equal(routeLabel(null), 'unknown')
   assert.equal(routeLabel({ provider: 'p', model: 'm' }), 'p/m')
+})
+
+test('titleFromEvent：提取 session/title 标题并去空白；其他事件返回 undefined', () => {
+  assert.equal(titleFromEvent(ev('session/title', 1, { title: '  配置修复  ' })), '配置修复')
+  assert.equal(titleFromEvent(ev('session/title', 1, { title: '   ' })), undefined)
+  assert.equal(titleFromEvent(ev('assistant/message', 1, {})), undefined)
+  assert.equal(titleFromEvent(ev('turn/start', 1, null)), undefined)
 })
 
 // ---------- 折叠（去重累加） ----------
@@ -185,6 +193,21 @@ test('fold：跨日替换样本在旧日桶中做减法', () => {
   assert.equal(fold.byDay[dayKey(DAY_B)].byRoute['p/m'].requests, 1)
 })
 
+test('折叠：session/title 事件记录标题（后到者胜），foldToStored 携带', () => {
+  const fold = createSessionFold({ createdAt: 0 })
+  // 与插件入口一致：仅当 titleFromEvent 返回非 undefined 时才赋值
+  const first = titleFromEvent(ev('session/title', 1, { title: 'Alpha 主题' }))
+  if (first !== undefined) fold.title = first
+  const second = titleFromEvent(ev('session/title', 2, { title: 'Beta 主题' }))
+  if (second !== undefined) fold.title = second
+  assert.equal(foldToStored(fold).title, 'Beta 主题')
+  // 空白标题提取为 undefined：不覆盖已有标题
+  assert.equal(titleFromEvent(ev('session/title', 3, { title: '   ' })), undefined)
+  assert.equal(foldToStored(fold).title, 'Beta 主题')
+  // 无标题事件：字段省略
+  assert.equal(foldToStored(createSessionFold({ createdAt: 0 })).title, undefined)
+})
+
 test('foldToStored：丢弃内存态 last/route，保留聚合值', () => {
   const fold = foldLog([
     ev('assistant/message', DAY_A, {
@@ -268,6 +291,11 @@ test('saveState/loadState：往返一致；文件缺失/损坏回退空状态', 
     saveState(file, state)
     const reloaded = loadState(file)
     assert.deepEqual(reloaded, state)
+
+    // title 字段往返保留
+    state.sessions['session-1'].title = '标题 X'
+    saveState(file, state)
+    assert.equal(loadState(file).sessions['session-1'].title, '标题 X')
 
     writeFileSync(file, '{ not json', 'utf8')
     assert.deepEqual(loadState(file), emptyState()) // 损坏
@@ -369,6 +397,20 @@ test('buildReport：recent 按窗口过滤且倒序', () => {
   assert.deepEqual(windowed.recent.map(c => c.time), [NOW, DAY_B])
 })
 
+test('buildReport：bySession/recent 行携带会话标题；recent 标题从状态解析', () => {
+  const state = twoSessionState()
+  state.sessions['session-aaa'].title = '项目A 调试'
+  const recent = [
+    { time: DAY_B, sessionId: 'session-aaa', route: null, source: 'message', usage: U(10, 5) },
+    { time: DAY_A, sessionId: 'session-bbb', route: null, source: 'chunk', usage: U(1, 2) },
+  ]
+  const report = buildReport(state, { now: NOW, recent, costPlan: PLAN })
+  assert.equal(report.bySession[0].title, '项目A 调试')
+  assert.equal(report.bySession[1].title, undefined)
+  assert.equal(report.recent[0].title, '项目A 调试') // 标题从状态解析（缓冲条目本身不含）
+  assert.equal(report.recent[1].title, undefined)
+})
+
 // ---------- 渲染 ----------
 
 test('renderReport：关键段落齐全', () => {
@@ -386,6 +428,23 @@ test('renderReport：关键段落齐全', () => {
   assert.ok(text.includes('按会话'))
   assert.ok(text.includes('最近调用'))
   assert.ok(text.includes('合计'))
+})
+
+test('renderReport：标题优先展示（标题 + 短 id），无标题回退 id', () => {
+  const state = twoSessionState()
+  state.sessions['session-aaa'].title = '项目A 调试'
+  const report = buildReport(state, {
+    now: NOW,
+    recent: [{ time: NOW, sessionId: 'session-aaa', route: { provider: 'p1', model: 'm1' }, source: 'message', usage: U(60, 30) }],
+    costPlan: PLAN,
+  })
+  const text = renderReport(report)
+  assert.ok(text.includes('项目A 调试（session-aaa）')) // 按会话
+  assert.ok(text.includes('项目A 调试（session-aaa）')) // 最近调用（同短 id）
+  // 无标题会话行仍显示 id
+  assert.ok(text.includes('session-bbb'))
+  const plain = renderReport(buildReport(twoSessionState(), { now: NOW, recent: [], costPlan: PLAN }))
+  assert.ok(plain.includes('session-aaa'))
 })
 
 // ---------- 环形缓冲 ----------

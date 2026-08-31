@@ -48,6 +48,17 @@ function shortSession(id: string): string {
   return id.length > 15 ? `${id.slice(0, 15)}…` : id
 }
 
+/** 会话标签：有标题显示 "标题 · 短id"，否则仅短 id */
+function sessionCell(title: string | undefined, sessionId: string): ReactElement {
+  if (title === undefined || title.length === 0) return <>{shortSession(sessionId)}</>
+  return (
+    <>
+      {title}
+      <span className="tts-muted"> · {shortSession(sessionId)}</span>
+    </>
+  )
+}
+
 function Card({ label, value, sub }: { label: string; value: string; sub?: string }): ReactElement {
   return (
     <div className="tts-card">
@@ -250,7 +261,9 @@ export function TokenStatsView(): ReactElement {
                   <tbody>
                     {report.bySession.map(row => (
                       <tr key={row.sessionId}>
-                        <td className="tts-ellipsis" title={row.cwd ?? row.sessionId}>{shortSession(row.sessionId)}</td>
+                        <td className="tts-ellipsis" title={row.title !== undefined ? `${row.title}（${row.sessionId}）` : (row.cwd ?? row.sessionId)}>
+                          {sessionCell(row.title, row.sessionId)}
+                        </td>
                         <td>{row.requests}</td>
                         <td>{fmtTokens(row.totalTokens)}</td>
                         <td>{fmtYuan(row.costYuan)}</td>
@@ -275,7 +288,9 @@ export function TokenStatsView(): ReactElement {
                 {report.recent.slice(0, 10).map((row, i) => (
                   <div key={`${row.time}-${i}`} className="tts-recent-row">
                     <span className="tts-muted">{fmtClock(row.time)}</span>
-                    <span className="tts-ellipsis" title={row.sessionId}>{shortSession(row.sessionId)}</span>
+                    <span className="tts-ellipsis" title={row.title !== undefined ? `${row.title}（${row.sessionId}）` : row.sessionId}>
+                      {sessionCell(row.title, row.sessionId)}
+                    </span>
                     <span className="tts-ellipsis" title={row.routeLabel}>{row.routeLabel}</span>
                     <span className="tts-recent-nums">
                       入 {fmtTokens(row.usage.inputTokens + row.usage.cacheReadTokens + row.usage.cacheWriteTokens)}

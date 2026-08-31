@@ -58,6 +58,7 @@ import {
   type StatsReport,
   type TokenStatsState,
   type UsageSample,
+  titleFromEvent,
 } from './logic.js'
 
 export const name = 'dsh-token-stats-xg'
@@ -130,6 +131,7 @@ const statsOutputSchema = {
         additionalProperties: false,
         properties: {
           sessionId: { type: 'string' },
+          title: { type: 'string' },
           cwd: { type: 'string' },
           agentPreset: { type: 'string' },
           requests: { type: 'integer' },
@@ -177,6 +179,7 @@ const statsOutputSchema = {
         properties: {
           time: { type: 'integer' },
           sessionId: { type: 'string' },
+          title: { type: 'string' },
           route: { oneOf: [routeSchema, { type: 'null' }] },
           source: { type: 'string', enum: ['message', 'chunk'] },
           usage: usageSchema,
@@ -275,6 +278,56 @@ export function apply(ctx: Context, config: Config): void {
     }
   }, 'token-stats:state')
 
+  // ---------- 会话标题回填（可选依赖 session-query；缺省时仅用折叠所得标题） ----------
+
+  /** session-query 服务的结构化子集（readTitleSnapshots 折叠持久化日志中的 session/title 事件） */
+  interface TitleBackfillService {
+    readTitleSnapshots(
+      sessionIds: readonly string[],
+      signal?: AbortSignal,
+    ): Promise<ReadonlyArray<
+      | { status: 'fulfilled'; value: { title?: { title: string } } }
+      | { status: 'rejected'; reason: unknown }
+    >>
+  }
+
+  const sessionQuery = ctx.get('sessionQuery') as TitleBackfillService | undefined
+  /** 已解析的会话标题缓存（回填过的 id 不再重复读日志） */
+  const titleCache = new Map<string, string>()
+
+  /**
+   * 为缺少标题的跟踪会话回填标题：折叠持久化/内存日志中的 session/title
+   * 事件（session-query 优先用内存日志，缺失时读持久化日志）。解析结果写入
+   * 状态（随下一次 flush 落盘）。可选依赖：sessionQuery 缺失时静默跳过。
+   */
+  async function backfillTitles(): Promise<void> {
+    if (sessionQuery === undefined) return
+    const need = Object.keys(state.sessions).filter(id =>
+      state.sessions[id]!.title === undefined && !titleCache.has(id))
+    if (need.length === 0) return
+    let results: Awaited<ReturnType<TitleBackfillService['readTitleSnapshots']>>
+    try {
+      results = await sessionQuery.readTitleSnapshots(need)
+    } catch (error) {
+      console.warn(`[token-stats] title backfill failed: ${String(error)}`)
+      return
+    }
+    let changed = false
+    results.forEach((result, i) => {
+      const id = need[i]
+      if (id === undefined || result.status !== 'fulfilled') return
+      const title = result.value?.title?.title
+      if (typeof title !== 'string' || title.length === 0) return
+      titleCache.set(id, title)
+      const session = state.sessions[id]
+      if (session !== undefined && session.title === undefined) {
+        session.title = title
+        changed = true
+      }
+    })
+    if (changed) scheduleFlush()
+  }
+
   // ---------- Web 看板 API（webServer 为 inject 硬依赖，apply 时必然就绪） ----------
 
   function json(res: ServerResponse, status: number, body: unknown): void {
@@ -297,13 +350,14 @@ export function apply(ctx: Context, config: Config): void {
   ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
     path: API_PREFIX,
-    handler: (req, res) => {
+    handler: async (req, res) => {
       try {
         const url = new URL(req.url ?? '/', 'http://127.0.0.1')
         if (url.pathname !== `${API_PREFIX}/report`) {
           json(res, 404, { error: 'not found' })
           return
         }
+        await backfillTitles()
         const days = intParam(url.searchParams.get('days'), 1, 3650)
         const limit = intParam(url.searchParams.get('limit'), 1, 100)
         const report = buildReport(state, {
@@ -386,6 +440,8 @@ export function apply(ctx: Context, config: Config): void {
       const fold = createSessionFold(metaOf(session))
       folds.set(id, fold)
       for (const event of session.events) {
+        const title = titleFromEvent(event)
+        if (title !== undefined) fold.title = title
         const route = routeFromEvent(event)
         if (route !== null) fold.route = route
         const sample = sampleFromEvent(event, fold.route)
@@ -410,6 +466,14 @@ export function apply(ctx: Context, config: Config): void {
       const id = String(session.id)
       liveSeen.add(id)
       const fold = foldFor(id, session)
+      // 会话标题增量更新（session/title 事件；最新胜出）
+      const title = titleFromEvent(event)
+      if (title !== undefined) {
+        fold.title = title
+        state.sessions[id] = foldToStored(fold)
+        scheduleFlush()
+        return
+      }
       const route = routeFromEvent(event)
       if (route !== null) fold.route = route
       const sample = sampleFromEvent(event, fold.route)
@@ -435,7 +499,8 @@ export function apply(ctx: Context, config: Config): void {
       render: (_args, value) => [{ type: 'text' as const, text: renderReport(value as unknown as StatsReport) }],
     },
     isConcurrencySafe: () => true,
-    execute(args) {
+    async execute(args) {
+      await backfillTitles()
       const report = buildReport(state, {
         days: args.days,
         sessionId: args.sessionId,
@@ -444,10 +509,17 @@ export function apply(ctx: Context, config: Config): void {
         recent,
         costPlan,
       })
-      return Promise.resolve(report)
+      return report
     },
     presentCall: args => ({ card: 'generic', title: '查询 Token 用量统计', kind: 'other', rawInput: args }),
   }))
+
+  // 启动后延迟回填一次历史标题（不阻塞启动；查询路径仍有兜底回填）
+  ctx.effect(() => {
+    const warmup = setTimeout(() => { void backfillTitles() }, 3_000)
+    warmup.unref?.()
+    return () => clearTimeout(warmup)
+  }, 'token-stats:title-warmup')
 
   console.log(
     `[token-stats] started: dir=${dir} trackedSessions=${Object.keys(state.sessions).length} logCalls=${logCalls} flushMs=${flushMs} api=${API_PREFIX}/report`

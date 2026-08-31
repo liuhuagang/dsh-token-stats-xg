@@ -31,6 +31,8 @@ export interface TotalRow extends UsageRow {
 
 export interface SessionRow extends UsageRow {
   sessionId: string
+  /** 会话标题（无标题事件时省略） */
+  title?: string
   cwd?: string
   agentPreset?: string
   costYuan: number
@@ -51,6 +53,8 @@ export interface RouteRow extends UsageRow {
 export interface RecentRow {
   time: number
   sessionId: string
+  /** 会话标题（无标题事件时省略） */
+  title?: string
   routeLabel: string
   source: 'message' | 'chunk'
   usage: UsageBuckets
