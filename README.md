@@ -1,8 +1,6 @@
 # dsh-token-stats-xg — 跨会话模型 Token 用量监听与统计
 
-<div align="center">
-  <sub><b>简体中文</b> | <a href="README_EN.md">English</a></sub>
-</div>
+**简体中文** · [English](README_EN.md)
 
 > [!NOTE] 维护状态
 > 本插件为 XG 系列内部工具，**仅供学习参考，不承诺维护**（issue 不保证响应）。

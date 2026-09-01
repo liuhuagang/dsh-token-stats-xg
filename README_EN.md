@@ -1,8 +1,6 @@
 # dsh-token-stats-xg — Cross-Session Model Token Usage Monitoring & Statistics
 
-<div align="center">
-  <sub><a href="README.md">简体中文</a> | <b>English</b></sub>
-</div>
+[简体中文](README.md) · **English**
 
 > [!NOTE] Maintenance Status
 > This plugin is an internal XG-series tool, **provided for learning/reference only, with no maintenance commitment** (issues are not guaranteed a response).
