@@ -32,7 +32,9 @@ const STYLES = `
 .tts-window { display: flex; gap: 2px; padding: 2px; border-radius: 8px; background: var(--dsw-alias-bg-layer-2, rgba(255, 255, 255, 0.06)); }
 .tts-window button { border: 0; background: transparent; color: var(--dsw-alias-label-secondary, rgba(255, 255, 255, 0.55)); font-size: 12px; padding: 4px 12px; border-radius: 6px; cursor: pointer; line-height: 1.4; }
 .tts-window button:hover { color: var(--dsw-alias-label-primary, #ffffff); }
-.tts-window button.active { background: var(--dsw-alias-brand-primary, #ff7a1a); color: #ffffff; }
+/* 主强调色随主题翻转（深色主题下为近白、浅色下为近黑），
+ * 因此激活态文字必须用配套的 label-primary-foreground，不能写死 #fff（与提示音插件同口径）。 */
+.tts-window button.active { background: var(--dsw-alias-button-primary-fill, #ff7a1a); color: var(--dsw-alias-label-primary-foreground, #111827); }
 .tts-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
 .tts-card { background: var(--dsw-alias-bg-layer-1, rgba(255, 255, 255, 0.04)); border: 1px solid var(--dsw-alias-border-l1, rgba(255, 255, 255, 0.1)); border-radius: 10px; padding: 12px 14px; min-width: 0; }
 .tts-card-label { font-size: 12px; color: var(--dsw-alias-label-secondary, rgba(255, 255, 255, 0.55)); }

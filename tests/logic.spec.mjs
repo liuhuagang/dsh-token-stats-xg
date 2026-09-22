@@ -11,24 +11,35 @@ import { join } from 'node:path'
 import {
   addCost,
   addUsage,
+  appendArchiveLine,
+  archiveFilePath,
   buildReport,
+  countArchiveDuplicates,
   createSessionFold,
   dayKey,
   defaultCostPlan,
   emptyState,
   emptyUsage,
+  encodeArchiveLine,
   estimateRouteCost,
+  foldSessionEvents,
   foldToStored,
   foldUsageSample,
   hourlyHistogram,
+  loadArchiveText,
   loadState,
+  mergedSessions,
   normalizeUsage,
+  parseArchiveLine,
   pushRecent,
+  readArchiveFile,
   renderReport,
+  rewriteArchive,
   routeFromEvent,
   routeLabel,
   sampleFromEvent,
   saveState,
+  serializeArchive,
   stateFilePath,
   titleFromEvent,
   totalTokens,
@@ -160,6 +171,47 @@ test('fold：无 message 的失败请求保留 chunk 样本（请求级兜底）
   assert.equal(fold.requests, 1)
   assert.deepEqual(fold.totals, U(77, 0))
   assert.deepEqual(fold.byDay['2026-08-20'].byRoute['p1/m1'].usage, U(77, 0))
+})
+
+test('foldSessionEvents：fork 继承前缀只折叠会话自身事件，不重复计父会话历史', () => {
+  // 父会话两个 turn 的用量（归属父会话条目，fork 种子会把它们带进子会话日志前缀）
+  const parentLog = [
+    ev('assistant/message', DAY_A, {
+      turn: 1, step: 0,
+      usage: { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 2000 },
+      message: { source: { provider: 'p1', model: 'm1' } },
+    }),
+    ev('assistant/message', DAY_A, {
+      turn: 2, step: 0,
+      usage: { inputTokens: 3000, outputTokens: 200, cacheReadTokens: 4000 },
+      message: { source: { provider: 'p1', model: 'm1' } },
+    }),
+  ]
+  // fork 子会话完整日志 = 种子（父前缀，= DSH inheritedEventCount）+ 自身事件
+  const inheritedCount = parentLog.length
+  const childOwn = [
+    ev('assistant/message', DAY_B, {
+      turn: 3, step: 0,
+      usage: { inputTokens: 50, outputTokens: 10 },
+      message: { source: { provider: 'p2', model: 'm2' } },
+    }),
+  ]
+  const childFullLog = [...parentLog, ...childOwn]
+
+  // 当前入口语义：只折叠 session.ownEvents()（inheritedCount 起的尾段）
+  const fold = createSessionFold({ createdAt: 0 })
+  foldSessionEvents(fold, childFullLog.slice(inheritedCount))
+  assert.equal(fold.requests, 1)
+  assert.deepEqual(fold.totals, U(50, 10))
+  assert.equal(fold.lastActivity, DAY_B)
+  assert.equal(Object.keys(fold.byDay).length, 1) // 父历史的 DAY_A 桶不出现
+  assert.deepEqual(fold.byDay[dayKey(DAY_B)].usage, U(50, 10))
+
+  // 旧行为锚点（≤1.4.0 整段折叠完整日志）：父历史被重复计入子条目
+  const legacy = createSessionFold({ createdAt: 0 })
+  foldSessionEvents(legacy, childFullLog)
+  assert.equal(legacy.requests, 3)
+  assert.deepEqual(legacy.totals, U(4050, 310, { cacheReadTokens: 6000 }))
 })
 
 test('fold：同步骤等值样本重复到达不产生变化', () => {
@@ -513,7 +565,7 @@ test('estimateRouteCost：DeepSeek 命中/未命中/输出分档，缓存写归�
     U(1_000_000, 500_000, { cacheReadTokens: 2_000_000, cacheWriteTokens: 100_000 }),
     PLAN,
   )
-  assert.deepEqual(cost, { deepseekYuan: 4.0, localYuan: 0, totalYuan: 4.0 })
+  assert.deepEqual(cost, { deepseekYuan: 4.0, localYuan: 0, remoteYuan: 4.0, savedYuan: 0, totalYuan: 4.0 })
 })
 
 test('estimateRouteCost：DeepSeek 模型不在价目表内不计费', () => {
@@ -525,12 +577,21 @@ test('estimateRouteCost：本地按 GPU 负载折算电费（输出/未命中输
   // 输出 1M → 20000s；未命中输入 1M → 1000s；共 21000s = 3.5 kWh = 2.1 元
   const cost = estimateRouteCost('llama-local/Qwen-x', U(1_000_000, 1_000_000), PLAN)
   assert.ok(Math.abs(cost.localYuan - 2.1) < 1e-9)
-  assert.deepEqual(cost, { deepseekYuan: 0, localYuan: 2.1, totalYuan: 2.1 })
-  // 缓存读不折算 GPU 时间：大量缓存读不产生电费
-  assert.deepEqual(estimateRouteCost('llama-local/Qwen-x', U(0, 0, { cacheReadTokens: 100_000_000 }), PLAN), zeroCost())
-  // 纯输出 1M → 20000s = 3.3333 kWh = 2.0 元
+  // Qwen-x 不在价目表 → 兜底 flash 价：miss 1M×1.5 + out 1M×4.5 = 6.0
+  assert.ok(Math.abs(cost.remoteYuan - 6.0) < 1e-9)
+  assert.ok(Math.abs(cost.savedYuan - 3.9) < 1e-9)
+  assert.equal(cost.deepseekYuan, 0)
+  assert.ok(Math.abs(cost.totalYuan - cost.localYuan) < 1e-9)
+  // 缓存读不折算 GPU 时间：大量缓存读电费为 0，但远端等价仍按命中价计
+  const cacheOnly = estimateRouteCost('llama-local/Qwen-x', U(0, 0, { cacheReadTokens: 100_000_000 }), PLAN)
+  assert.equal(cacheOnly.localYuan, 0)
+  assert.ok(Math.abs(cacheOnly.remoteYuan - 5.0) < 1e-9) // 100M × 0.05/百万
+  assert.ok(Math.abs(cacheOnly.savedYuan - 5.0) < 1e-9)
+  // 纯输出 1M → 20000s = 3.3333 kWh = 2.0 元；远端等价 = 1M × 4.5 = 4.5
   const outOnly = estimateRouteCost('llama-local/Qwen-x', U(0, 1_000_000), PLAN)
   assert.ok(Math.abs(outOnly.localYuan - 2.0) < 1e-9)
+  assert.ok(Math.abs(outOnly.remoteYuan - 4.5) < 1e-9)
+  assert.ok(Math.abs(outOnly.savedYuan - 2.5) < 1e-9)
 })
 
 test('estimateRouteCost：未知/未配置计费的 route 为零费用', () => {
@@ -539,9 +600,72 @@ test('estimateRouteCost：未知/未配置计费的 route 为零费用', () => {
   assert.deepEqual(estimateRouteCost('no-slash', U(1, 1), PLAN), zeroCost())
 })
 
-test('addCost：逐项累加，totalYuan = deepseek + local', () => {
-  const a = addCost({ deepseekYuan: 1.5, localYuan: 2.5, totalYuan: 4 }, { deepseekYuan: 0.5, localYuan: 0.5, totalYuan: 1 })
-  assert.deepEqual(a, { deepseekYuan: 2, localYuan: 3, totalYuan: 5 })
+test('estimateRouteCost：本地路由按同名模型估算等价远端费用与折算节约', () => {
+  // 同名映射：llama-local/deepseek-v4-flash 按 deepseek-v4-flash 官网价计
+  // 远端等价 = 4.0（同 DeepSeek 分档）；电费 = 11100s = 1.85kWh × 0.6 = 1.11 元
+  const cost = estimateRouteCost(
+    'llama-local/deepseek-v4-flash',
+    U(1_000_000, 500_000, { cacheReadTokens: 2_000_000, cacheWriteTokens: 100_000 }),
+    PLAN,
+  )
+  assert.equal(cost.deepseekYuan, 0)
+  assert.ok(Math.abs(cost.localYuan - 1.11) < 1e-9)
+  assert.ok(Math.abs(cost.remoteYuan - 4.0) < 1e-9)
+  assert.ok(Math.abs(cost.savedYuan - 2.89) < 1e-9)
+  assert.ok(Math.abs(cost.totalYuan - cost.localYuan) < 1e-9)
+})
+
+test('estimateRouteCost：localToRemoteModel 精确映射覆盖同名查找', () => {
+  const plan = { ...PLAN, localToRemoteModel: { 'Qwen-x': 'deepseek-v4-flash' } }
+  // 映射后按 deepseek-v4-flash 价：miss 1.65 + hit 0.10 + out 2.25 = 4.0
+  const cost = estimateRouteCost(
+    'llama-local/Qwen-x',
+    U(1_000_000, 500_000, { cacheReadTokens: 2_000_000, cacheWriteTokens: 100_000 }),
+    plan,
+  )
+  assert.ok(Math.abs(cost.remoteYuan - 4.0) < 1e-9)
+  assert.ok(Math.abs(cost.savedYuan - (4.0 - cost.localYuan)) < 1e-9)
+  // 未映射的模型走兜底 flash 价（不再为 0）
+  const other = estimateRouteCost('llama-local/other', U(1, 1), plan)
+  assert.ok(Math.abs(other.remoteYuan - 0.000006) < 1e-12) // (1×1.5 + 1×4.5)/1e6
+})
+
+test('estimateRouteCost：localToRemoteModel 前缀匹配（最长前缀优先，精确命中优先）', () => {
+  const plan = { ...PLAN, localToRemoteModel: { Qwen: 'deepseek-v4-pro', 'Qwen3.8-27B': 'deepseek-v4-flash' } }
+  const usage = U(1_000_000, 500_000, { cacheReadTokens: 2_000_000, cacheWriteTokens: 100_000 })
+  // 最长前缀命中：Qwen3.8-27B-UD-IQ4_XS-176K-Text-MTP → flash 价 4.0
+  const a = estimateRouteCost('llama-local/Qwen3.8-27B-UD-IQ4_XS-176K-Text-MTP', usage, plan)
+  assert.ok(Math.abs(a.remoteYuan - 4.0) < 1e-9)
+  // 仅短前缀命中：Qwen2.5-7B-Instruct → pro 价：miss 4.95 + hit 0.30 + out 6.75 = 12.0
+  const b = estimateRouteCost('llama-local/Qwen2.5-7B-Instruct', usage, plan)
+  assert.ok(Math.abs(b.remoteYuan - 12.0) < 1e-9)
+  // 精确命中优先于前缀：加上精确键后按 flash 价
+  const plan2 = { ...plan, localToRemoteModel: { ...plan.localToRemoteModel, 'Qwen2.5-7B-Instruct': 'deepseek-v4-flash' } }
+  const c = estimateRouteCost('llama-local/Qwen2.5-7B-Instruct', usage, plan2)
+  assert.ok(Math.abs(c.remoteYuan - 4.0) < 1e-9)
+})
+
+test('estimateRouteCost：关闭兜底时未映射本地模型等价远端费用为 0，折算节约为负', () => {
+  const plan = { ...PLAN, localFallbackRemoteModel: null }
+  const cost = estimateRouteCost('llama-local/Qwen-x', U(0, 1_000_000), plan)
+  assert.equal(cost.remoteYuan, 0)
+  assert.ok(Math.abs(cost.savedYuan + 2.0) < 1e-9)
+})
+
+test('defaultCostPlan：默认本地 provider 覆盖常见后端，等价远端默认兜底 flash 价', () => {
+  const plan = defaultCostPlan()
+  for (const p of ['llama-local', 'sglang-local', 'vllm-local', 'ollama']) {
+    assert.ok(plan.localProviders.includes(p), `missing local provider ${p}`)
+  }
+  assert.equal(plan.localFallbackRemoteModel, 'deepseek-v4-flash')
+})
+
+test('addCost：逐项累加，totalYuan = deepseek + local（不重复累加）', () => {
+  const a = addCost(
+    { deepseekYuan: 1.5, localYuan: 2.5, remoteYuan: 5, savedYuan: 1, totalYuan: 4 },
+    { deepseekYuan: 0.5, localYuan: 0.5, remoteYuan: 1, savedYuan: 0, totalYuan: 1 },
+  )
+  assert.deepEqual(a, { deepseekYuan: 2, localYuan: 3, remoteYuan: 6, savedYuan: 1, totalYuan: 5 })
 })
 
 test('buildReport：费用按路由聚合（total 细分 / byRoute / byDay / bySession）', () => {
@@ -582,12 +706,20 @@ test('buildReport：费用按路由聚合（total 细分 / byRoute / byDay / byS
   assert.ok(Math.abs(report.total.cost.deepseekYuan - 4.0) < 1e-9)
   assert.ok(Math.abs(report.total.cost.localYuan - 2.0) < 1e-9)
   assert.ok(Math.abs(report.total.cost.totalYuan - 6.0) < 1e-9)
+  // remoteYuan：deepseek 路由本身 4.0 + 本地等价（Qwen-x 兜底 flash 价 4.5）
+  assert.ok(Math.abs(report.total.cost.remoteYuan - 8.5) < 1e-9)
+  // savedYuan：仅本地路由贡献 = 4.5 - 2.0
+  assert.ok(Math.abs(report.total.cost.savedYuan - 2.5) < 1e-9)
   // byRoute：两行各带 cost 细分
   const ds = report.byRoute.find(r => r.route === 'deepseek-official/deepseek-v4-flash')
   assert.ok(Math.abs(ds.cost.deepseekYuan - 4.0) < 1e-9)
   assert.equal(ds.cost.localYuan, 0)
+  assert.ok(Math.abs(ds.cost.remoteYuan - 4.0) < 1e-9)
+  assert.equal(ds.cost.savedYuan, 0) // 远端路由无节约
   const local = report.byRoute.find(r => r.route === 'llama-local/Qwen-x')
   assert.ok(Math.abs(local.cost.localYuan - 2.0) < 1e-9)
+  assert.ok(Math.abs(local.cost.remoteYuan - 4.5) < 1e-9) // 兜底 flash 输出价
+  assert.ok(Math.abs(local.cost.savedYuan - 2.5) < 1e-9)
   // byDay / bySession 行费用
   assert.ok(Math.abs(report.byDay.find(d => d.day === '2026-08-21').costYuan - 4.0) < 1e-9)
   assert.ok(Math.abs(report.byDay.find(d => d.day === '2026-08-20').costYuan - 2.0) < 1e-9)
@@ -632,17 +764,25 @@ test('buildReport：本地电费不超过窗口满载上限（按比例分摊）
   // 折算合计 220 元 → clamp 到 8.64 元
   assert.ok(Math.abs(report.total.cost.localYuan - 8.64) < 1e-9)
   assert.equal(report.total.cost.deepseekYuan, 0)
+  // 等价远端费用不受上限影响（token 线性）：heavy 450 + light 45 = 495
+  assert.ok(Math.abs(report.total.cost.remoteYuan - 495) < 1e-9)
+  // 折算节约 = 远端等价 - clamp 后电费
+  assert.ok(Math.abs(report.total.cost.savedYuan - 486.36) < 1e-9)
   // 按比例分摊：heavy 占 200/220，light 占 20/220
   const heavy = report.byRoute.find(r => r.route === 'llama-local/Qwen-x')
   const light = report.byRoute.find(r => r.route === 'llama-local/Qwen-y')
   assert.ok(Math.abs(heavy.cost.localYuan - 8.64 * 200 / 220) < 1e-9)
   assert.ok(Math.abs(light.cost.localYuan - 8.64 * 20 / 220) < 1e-9)
+  // 分摊后各行折算节约 = 各自远端等价 − 分摊后电费
+  assert.ok(Math.abs(heavy.cost.savedYuan - (450 - 8.64 * 200 / 220)) < 1e-9)
+  assert.ok(Math.abs(light.cost.savedYuan - (45 - 8.64 * 20 / 220)) < 1e-9)
   // 行级（byDay/bySession）与总量一致
   assert.ok(Math.abs(report.byDay[0].costYuan - 8.64) < 1e-9)
   assert.ok(Math.abs(report.bySession[0].costYuan + report.bySession[1].costYuan - 8.64) < 1e-9)
   // 全部历史窗口不设上限（无窗口天数）
   const full = buildReport(state, { now: NOW, recent: [], costPlan: PLAN })
   assert.ok(Math.abs(full.total.cost.localYuan - 220) < 1e-9)
+  assert.ok(Math.abs(full.total.cost.savedYuan - 275) < 1e-9) // 495 - 220
 })
 
 test('renderReport：含估算费用行', () => {
@@ -651,4 +791,142 @@ test('renderReport：含估算费用行', () => {
   assert.ok(text.includes('估算费用'))
   assert.ok(text.includes('DeepSeek API'))
   assert.ok(text.includes('本地电费'))
+  assert.ok(text.includes('若全部走远端约'))
+  assert.ok(text.includes('折算节约'))
+})
+
+// ---------- 归档层（archive.jsonl / 合并视图） ----------
+
+/** 构造一条规范会话记录（sanitize 后形状稳定，可深比较） */
+function mkEntry(over = {}) {
+  return {
+    createdAt: 0,
+    requests: 0,
+    totals: U(0, 0),
+    lastActivity: 0,
+    byDay: {},
+    ...over,
+  }
+}
+
+const ENTRY_A = mkEntry({
+  createdAt: DAY_A,
+  requests: 2,
+  totals: U(10, 5, { cacheReadTokens: 3 }),
+  lastActivity: DAY_A,
+  byDay: { '2026-08-20': { requests: 2, usage: U(10, 5, { cacheReadTokens: 3 }), byRoute: { 'p1/m1': { requests: 2, usage: U(10, 5, { cacheReadTokens: 3 }) } } } },
+  title: '历史会话 A',
+  cwd: '/proj/a',
+  agentPreset: 'standard',
+})
+
+const ENTRY_B = mkEntry({
+  createdAt: DAY_B,
+  requests: 1,
+  totals: U(2, 1),
+  lastActivity: DAY_B,
+  byDay: { '2026-08-21': { requests: 1, usage: U(2, 1), byRoute: { 'p2/m2': { requests: 1, usage: U(2, 1) } } } },
+})
+
+test('encodeArchiveLine/parseArchiveLine：往返一致，非法行返回 null', () => {
+  const line = encodeArchiveLine('session-a', ENTRY_A, 111)
+  const parsed = parseArchiveLine(line)
+  assert.equal(parsed.id, 'session-a')
+  assert.equal(parsed.archivedAt, 111)
+  assert.deepEqual(parsed.entry, ENTRY_A)
+  assert.equal(parseArchiveLine(''), null)
+  assert.equal(parseArchiveLine('not json'), null)
+  assert.equal(parseArchiveLine('{"v":99,"id":"x","entry":{}}'), null) // 版本不符
+  assert.equal(parseArchiveLine('{"v":1,"id":"","entry":null}'), null)
+  assert.equal(parseArchiveLine('{"v":1,"id":"x","entry":{"totals":null}}'), null) // 条目非法
+})
+
+test('loadArchiveText：同 id 后写胜出（last-wins）', () => {
+  const text = `${encodeArchiveLine('session-a', ENTRY_A, 1)}\n${encodeArchiveLine('session-b', ENTRY_B, 2)}\n${encodeArchiveLine('session-a', ENTRY_B, 3)}\n`
+  const map = loadArchiveText(text)
+  assert.equal(map.size, 2)
+  assert.deepEqual(map.get('session-a'), ENTRY_B) // 后写覆盖
+  assert.deepEqual(map.get('session-b'), ENTRY_B)
+})
+
+test('countArchiveDuplicates：统计总行数与重复行数', () => {
+  const text = `${encodeArchiveLine('session-a', ENTRY_A, 1)}\n${encodeArchiveLine('session-a', ENTRY_B, 2)}\nnot-json\n${encodeArchiveLine('session-b', ENTRY_B, 3)}\n`
+  const { lines, duplicateLines } = countArchiveDuplicates(text)
+  assert.equal(lines, 3)
+  assert.equal(duplicateLines, 1)
+})
+
+test('serializeArchive/rewriteArchive/readArchiveFile：重写后去重且可读回', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ts-arch-'))
+  try {
+    const file = archiveFilePath(dir)
+    const map = new Map([
+      ['session-b', ENTRY_B],
+      ['session-a', ENTRY_A],
+    ])
+    rewriteArchive(file, map, 42)
+    const read = readArchiveFile(file)
+    assert.equal(read.lines, 2)
+    assert.equal(read.duplicateLines, 0)
+    assert.deepEqual([...read.map.keys()].sort(), ['session-a', 'session-b'])
+    assert.deepEqual(read.map.get('session-a'), ENTRY_A)
+    assert.ok(serializeArchive(map, 42).endsWith('\n'))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('appendArchiveLine：追加语义 + 重复行可被 readArchiveFile 以 last-wins 收敛', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ts-arch-'))
+  try {
+    const file = archiveFilePath(dir)
+    appendArchiveLine(file, 'session-a', ENTRY_A, 1)
+    appendArchiveLine(file, 'session-b', ENTRY_B, 2)
+    appendArchiveLine(file, 'session-a', ENTRY_B, 3) // 同 id 再终态化一次
+    const read = readArchiveFile(file)
+    assert.equal(read.lines, 3)
+    assert.equal(read.duplicateLines, 1)
+    assert.equal(read.map.size, 2)
+    assert.deepEqual(read.map.get('session-a'), ENTRY_B)
+    // 压实收敛为单行
+    rewriteArchive(file, read.map, 4)
+    const compacted = readArchiveFile(file)
+    assert.equal(compacted.lines, 2)
+    assert.equal(compacted.duplicateLines, 0)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('mergedSessions：热层优先，归档补齐缺失会话', () => {
+  const hot = { 'session-a': ENTRY_A, 'session-hot': mkEntry({ requests: 3 }) }
+  const archived = new Map([
+    ['session-a', ENTRY_B], // 与热层同 id：应被热层覆盖
+    ['session-b', ENTRY_B],
+  ])
+  const merged = mergedSessions(hot, archived)
+  assert.deepEqual(Object.keys(merged).sort(), ['session-a', 'session-b', 'session-hot'])
+  assert.deepEqual(merged['session-a'], ENTRY_A) // 热层优先
+  assert.deepEqual(merged['session-b'], ENTRY_B)
+  assert.equal(Object.keys(merged).length, 3)
+  // 热层不被归档污染（引用不变）
+  assert.deepEqual(Object.keys(hot), ['session-a', 'session-hot'])
+})
+
+test('buildReport：合并视图（热层+归档）下按日/总量与"旧全量状态"一致', () => {
+  // 归档与热层分开时，报告应等价于把两者合成一个 sessions 的旧式状态
+  const hot = { 'session-hot': ENTRY_A }
+  const archived = new Map([['session-b', ENTRY_B]])
+  const full = { version: 1, sessions: mergedSessions(hot, archived) }
+  const legacy = {
+    version: 1,
+    sessions: { 'session-hot': ENTRY_A, 'session-b': ENTRY_B },
+  }
+  const opts = { now: NOW, recent: [], costPlan: PLAN }
+  const r1 = buildReport(full, opts)
+  const r2 = buildReport(legacy, opts)
+  assert.deepEqual(r1.byDay, r2.byDay)
+  assert.deepEqual(r1.total, r2.total)
+  assert.equal(r1.trackedSessionCount, 2)
+  assert.deepEqual(r1.bySession.map(s => s.sessionId).sort(), ['session-b', 'session-hot'])
 })

@@ -5,10 +5,13 @@
  *   - assistant/chunk(usage)：流式 usage 样本（请求失败也能保留）
  *   - assistant/message(usage)：该步骤最终 usage（替换同步骤 chunk 样本）
  *
- * 监听面（全局 ctx 注册，收到所有会话）：
- *   - session/created：会话公告时把整段内存日志批量折叠（含恢复会话的
- *     全部历史 —— 插件安装前发生的用量也在其中），折叠结果整体替换
- *     状态中该会话的条目（日志是 source of truth）
+ * 监听面（全局 ctx 注册，收到所有会话，含子代理会话）：
+ *   - session/created：会话公告时把该会话**自身产生**的内存日志批量折叠
+ *     （含恢复会话的全部自身历史 —— 插件安装前发生的用量也在其中），
+ *     折叠结果整体替换状态中该会话的条目（日志是 source of truth）。
+ *     fork 子会话日志前缀是父会话的已完成 turn 种子（inheritedEventCount），
+ *     其 usage 归属父会话条目，故只折叠 session.ownEvents()，避免父会话
+ *     历史被重复计入本会话与 total/byDay/byRoute/费用等全部聚合行。
  *   - session/event：实时增量折叠，每个步骤首条 usage 样本输出一条
  *     终端监控行（模型路由 + 输入/输出/缓存桶）
  *
@@ -28,6 +31,7 @@
 
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { statSync } from 'node:fs'
 import type { ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -35,15 +39,21 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 // Type-only: 引入 webServer 服务的模块增强（ctx.webServer 类型）。
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import {
+  appendArchiveLine,
+  archiveFilePath,
   buildReport,
   createSessionFold,
   defaultCostPlan,
+  foldSessionEvents,
   foldToStored,
   foldUsageSample,
   hourlyHistogram,
   loadState,
+  mergedSessions,
   pushRecent,
+  readArchiveFile,
   renderReport,
+  rewriteArchive,
   routeFromEvent,
   routeLabel,
   sampleFromEvent,
@@ -52,6 +62,7 @@ import {
   totalTokens,
   type CostPlan,
   type DeepseekModelPrice,
+  type FoldableEvent,
   type HourBucketRow,
   type RecentCommit,
   type SessionFold,
@@ -90,6 +101,8 @@ const costEstimateSchema = {
   properties: {
     deepseekYuan: { type: 'number' },
     localYuan: { type: 'number' },
+    remoteYuan: { type: 'number' },
+    savedYuan: { type: 'number' },
     totalYuan: { type: 'number' },
   },
 } as const
@@ -203,12 +216,37 @@ export interface Config {
   flushMs?: number
   /** 内存"最近调用"环形缓冲上限，默认 200 */
   recentLimit?: number
+  /**
+   * 分层存储：进程（插件）停止时把热层会话终态逐条追加进 archive.jsonl 并
+   * 清空热层文件，默认 true。热层 = 本次进程内公告/活跃的会话，防抖落盘只写
+   * 热层，历史总量不影响写盘与热层体积（历史在归档层只追加、不再改动）。
+   */
+  finalizeOnStop?: boolean
+  /**
+   * 按需物化的压缩日志体积上限（字节）。显式查询（token_stats sessionId /
+   * REST sessionId）命中的**未跟踪**存储会话，若其日志压缩体积不超过该值，
+   * 会在后台单会话折叠归档（队列化、逐个处理）；超过则跳过并提示改用
+   * 停机 worker（scripts/backfill.mjs）。默认 8MB——宿主内不碰大日志，
+   * 避免整段解析抢占事件循环卡住 DSH。
+   */
+  materializeMaxSizeBytes?: number
   /** DeepSeek 官方 provider 名（费用估算归属），默认 deepseek-official */
   deepseekProvider?: string
-  /** 按电费估算的本地 provider 名列表，默认 ['llama-local'] */
+  /** 按电费估算的本地 provider 名列表，默认 ['llama-local', 'sglang-local', 'vllm-local', 'ollama'] */
   localProviders?: string[]
   /** DeepSeek 单价覆盖（元/百万 tokens，官网空闲时段价）；合并进内置价目表 */
   deepseekPrices?: Record<string, DeepseekModelPrice>
+  /**
+   * 本地模型名 → 远端价目表模型名映射（等价远端费用用）。键按**前缀匹配**
+   * （精确命中优先，其次最长前缀），一条 'Qwen3.8-27B': 'deepseek-v4-flash'
+   * 即可覆盖所有量化变体；未命中映射时按同名查价目表
+   */
+  localToRemoteModel?: Record<string, string>
+  /**
+   * 未映射本地模型的兜底远端计费模型名；null 关闭兜底（等价远端费用 0），
+   * 默认 'deepseek-v4-flash'
+   */
+  localFallbackRemoteModel?: string | null
   /** 本地电价（元/千瓦时），默认 0.6 */
   localPricePerKwh?: number
   /** 本地整机功耗（瓦），默认 600 */
@@ -232,6 +270,10 @@ export function apply(ctx: Context, config: Config): void {
     deepseekProvider: config.deepseekProvider ?? defaults.deepseekProvider,
     localProviders: config.localProviders ?? defaults.localProviders,
     deepseekPrices: { ...defaults.deepseekPrices, ...config.deepseekPrices },
+    localToRemoteModel: { ...defaults.localToRemoteModel, ...config.localToRemoteModel },
+    localFallbackRemoteModel: config.localFallbackRemoteModel === undefined
+      ? defaults.localFallbackRemoteModel
+      : config.localFallbackRemoteModel,
     localPricePerKwh: config.localPricePerKwh ?? defaults.localPricePerKwh,
     localPowerWatts: config.localPowerWatts ?? defaults.localPowerWatts,
     localDecodeTps: config.localDecodeTps ?? defaults.localDecodeTps,
@@ -243,6 +285,70 @@ export function apply(ctx: Context, config: Config): void {
   /** 已观察到实时事件的会话（session/created 前若已出现实时事件则跳过历史折叠） */
   const liveSeen = new Set<string>()
   const recent: RecentCommit[] = []
+
+  // ---------- 归档层：只追加历史（热层 = state，归档 = archived） ----------
+
+  const archiveFile = archiveFilePath(dir)
+  const readArchive = readArchiveFile(archiveFile)
+  const archived = readArchive.map
+  // 同 id 重复行达到阈值时在启动时压实一次（去重，last-wins），之后只追加
+  if (readArchive.lines > 0 && readArchive.duplicateLines > 0
+    && (readArchive.duplicateLines >= 64 || readArchive.duplicateLines > readArchive.lines * 0.2)) {
+    try {
+      rewriteArchive(archiveFile, archived, Date.now())
+      console.log(`[token-stats] archive compacted: ${readArchive.lines} lines -> ${archived.size} sessions`)
+    } catch (error) {
+      console.warn(`[token-stats] archive compaction failed: ${String(error)}`)
+    }
+  }
+
+  /**
+   * 全量会话视图（热层 ∪ 归档，热层优先；仅引用合并，供只读查询）。
+   * 热层条目覆盖归档中同 id 的上一次终态，避免重复计数。
+   *
+   * 查询前先做归档热刷新：进程外 worker（scripts/backfill.mjs）可能与本宿主
+   * 并行向 archive.jsonl 追加历史基线，启动时装载的只读归档映射因此可能过期；
+   * 检测文件 mtime/size 变化后整表重载（last-wins 语义与启动装载一致）。
+   */
+  let archiveStat = archiveFileStat()
+  function archiveFileStat(): { size: number; mtimeMs: number } {
+    try {
+      const s = statSync(archiveFile)
+      return { size: s.size, mtimeMs: s.mtimeMs }
+    } catch {
+      return { size: -1, mtimeMs: -1 }
+    }
+  }
+  function refreshArchivedIfChanged(): void {
+    const current = archiveFileStat()
+    if (current.size === archiveStat.size && current.mtimeMs === archiveStat.mtimeMs) return
+    archiveStat = current
+    try {
+      const next = readArchiveFile(archiveFile)
+      archived.clear()
+      for (const [id, entry] of next.map) archived.set(id, entry)
+    } catch (error) {
+      console.warn(`[token-stats] archive hot-reload failed: ${String(error)}`)
+    }
+  }
+  const fullState = (): TokenStatsState => {
+    refreshArchivedIfChanged()
+    return {
+      version: 1,
+      sessions: mergedSessions(state.sessions, archived),
+    }
+  }
+
+  /** 终态化一个热层会话：追加归档行 + 更新内存归档表 */
+  function finalizeSession(id: string, entry: TokenStatsState['sessions'][string]): void {
+    const at = Date.now()
+    try {
+      appendArchiveLine(archiveFile, id, entry, at)
+      archived.set(id, entry)
+    } catch (error) {
+      console.warn(`[token-stats] archive append failed for ${id}: ${String(error)}`)
+    }
+  }
 
   // ---------- 状态写盘（防抖 + 卸载兜底） ----------
 
@@ -274,14 +380,32 @@ export function apply(ctx: Context, config: Config): void {
         clearTimeout(flushTimer)
         flushTimer = undefined
       }
-      flushNow()
+      if (config.finalizeOnStop === false) {
+        flushNow()
+        return
+      }
+      // 停时终态化：全部热层会话追加进归档并清空热层，使 token-stats.json
+      // 只反映"本次进程内的活跃会话"；历史查询走归档合并视图，重启后未再
+      // 公告的会话留在归档（热层文件保持小体积）。
+      try {
+        const entries = Object.entries(state.sessions)
+        for (const [id, entry] of entries) finalizeSession(id, entry)
+        state.sessions = {}
+        saveState(stateFile, state)
+        if (entries.length > 0) {
+          console.log(`[token-stats] stopped: finalized ${entries.length} hot sessions into archive (archive now ${archived.size})`)
+        }
+      } catch (error) {
+        console.warn(`[token-stats] stop finalize failed: ${String(error)}`)
+        flushNow()
+      }
     }
   }, 'token-stats:state')
 
-  // ---------- 会话标题回填（可选依赖 session-query；缺省时仅用折叠所得标题） ----------
+  // ---------- 会话标题回填 / 按需物化（可选依赖 session-query/session-persistence） ----------
 
-  /** session-query 服务的结构化子集（readTitleSnapshots 折叠持久化日志中的 session/title 事件） */
-  interface TitleBackfillService {
+  /** session-query 服务结构化子集（标题快照 + 整段读取） */
+  interface SessionQueryService {
     readTitleSnapshots(
       sessionIds: readonly string[],
       signal?: AbortSignal,
@@ -289,9 +413,20 @@ export function apply(ctx: Context, config: Config): void {
       | { status: 'fulfilled'; value: { title?: { title: string } } }
       | { status: 'rejected'; reason: unknown }
     >>
+    /** 读取一个会话的完整原始日志（不激活会话；事件经 replay 校验与打断补齐） */
+    readSession(id: string): Promise<{
+      session: Record<string, unknown>
+      inheritedEventCount: number
+      events: ReadonlyArray<Record<string, unknown>>
+    }>
   }
 
-  const sessionQuery = ctx.get('sessionQuery') as TitleBackfillService | undefined
+  /** session-persistence 服务结构化子集（廉价 stat：拿压缩体积做物化门槛） */
+  interface PersistenceStatService {
+    stat(id: string): Promise<{ sizeBytes?: number } | undefined>
+  }
+
+  const sessionQuery = ctx.get('sessionQuery') as SessionQueryService | undefined
   /** 已解析的会话标题缓存（回填过的 id 不再重复读日志） */
   const titleCache = new Map<string, string>()
 
@@ -305,7 +440,7 @@ export function apply(ctx: Context, config: Config): void {
     const need = Object.keys(state.sessions).filter(id =>
       state.sessions[id]!.title === undefined && !titleCache.has(id))
     if (need.length === 0) return
-    let results: Awaited<ReturnType<TitleBackfillService['readTitleSnapshots']>>
+    let results: Awaited<ReturnType<SessionQueryService['readTitleSnapshots']>>
     try {
       results = await sessionQuery.readTitleSnapshots(need)
     } catch (error) {
@@ -326,6 +461,86 @@ export function apply(ctx: Context, config: Config): void {
       }
     })
     if (changed) scheduleFlush()
+  }
+
+  /**
+   * 按需物化：显式查询（token_stats sessionId / REST sessionId）命中
+   * **未跟踪**的存储会话时，把小体积会话在后台逐个折叠进归档（与停时
+   * 终态化同一条 append 路径；幂等）。大体积会话不在宿主内读取——避免
+   * 整段日志解析抢占事件循环卡住 DSH，改用停机 worker（scripts/backfill.mjs）
+   * 全量基线。队列串行 + 每会话让出事件循环，单会话错误隔离。
+   */
+  const materializeMaxBytes = Math.max(0, Math.floor(config.materializeMaxSizeBytes ?? 8 * 1024 * 1024))
+  const materializing = new Set<string>()
+  let materializeChain: Promise<void> = Promise.resolve()
+
+  function foldStoredSession(id: string, snap: {
+    session: Record<string, unknown>
+    inheritedEventCount: number
+    events: ReadonlyArray<Record<string, unknown>>
+  }): void {
+    const header = snap.session ?? {}
+    const rawEvents = (snap.events ?? []) as ReadonlyArray<Record<string, unknown>>
+    // 与 session/created 的 ownEvents 语义对齐：fork 继承前缀的 usage 属于父会话
+    const inherited = Number(snap.inheritedEventCount ?? 0)
+    const events = Number.isFinite(inherited) && inherited > 0
+      ? rawEvents.slice(inherited)
+      : rawEvents
+    const fold = createSessionFold({
+      cwd: typeof header['cwd'] === 'string' ? header['cwd'] : undefined,
+      agentPreset: typeof header['agentPreset'] === 'string' ? header['agentPreset'] : undefined,
+      createdAt: isFiniteCreatedAt(header['createdAt']),
+    })
+    foldSessionEvents(fold, events as unknown as readonly FoldableEvent[])
+    finalizeSession(id, foldToStored(fold))
+  }
+
+  /** createdAt 字段守卫：合法 epoch ms 返回原值，否则 0 */
+  function isFiniteCreatedAt(value: unknown): number {
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0
+  }
+
+  /** 入队一次按需物化（已跟踪/在队中/服务缺失直接返回） */
+  function requestMaterialize(id: string): void {
+    if (id.length === 0) return
+    if (id in state.sessions || archived.has(id)) return
+    if (materializing.has(id)) return
+    if (ctx.get('sessionQuery') === undefined) return
+    materializing.add(id)
+    materializeChain = materializeChain
+      .then(async () => {
+        const svc = ctx.get('sessionQuery') as SessionQueryService | undefined
+        if (svc === undefined) return
+        try {
+          // 体积门槛：超过 materializeMaxBytes 的日志不在宿主内读（防卡顿）
+          const persistence = ctx.get('sessionPersistence') as PersistenceStatService | undefined
+          if (persistence !== undefined) {
+            try {
+              const stat = await persistence.stat(id)
+              const size = Number(stat?.sizeBytes ?? NaN)
+              if (Number.isFinite(size) && size > materializeMaxBytes) {
+                console.warn(
+                  `[token-stats] materialize ${id} skipped: log ${size} bytes > ${materializeMaxBytes} (use scripts/backfill.mjs with DSH stopped)`,
+                )
+                return
+              }
+            } catch {
+              // stat 不可用不阻塞：仍尝试小体积读取
+            }
+          }
+          const snap = await svc.readSession(id)
+          foldStoredSession(id, snap)
+          console.log(`[token-stats] materialized stored session ${id} (archive now ${archived.size})`)
+        } catch (error) {
+          console.warn(`[token-stats] materialize session ${id} failed: ${String(error)}`)
+        } finally {
+          await new Promise<void>(resolve => setImmediate(() => resolve()))
+        }
+      })
+      .catch(() => { /* 链上错误已在上层逐会话隔离 */ })
+      .finally(() => {
+        materializing.delete(id)
+      })
   }
 
   // ---------- Web 看板 API（webServer 为 inject 硬依赖，apply 时必然就绪） ----------
@@ -358,9 +573,11 @@ export function apply(ctx: Context, config: Config): void {
           return
         }
         await backfillTitles()
+        const idParam = url.searchParams.get('sessionId')?.trim()
+        if (idParam !== undefined && idParam.length > 0) requestMaterialize(idParam)
         const days = intParam(url.searchParams.get('days'), 1, 3650)
         const limit = intParam(url.searchParams.get('limit'), 1, 100)
-        const report = buildReport(state, {
+        const report = buildReport(fullState(), {
           days,
           limit,
           now: Date.now(),
@@ -427,8 +644,9 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- 监听器 ----------
 
   /**
-   * 会话公告：批量折叠整段内存日志（恢复会话携带全部历史），折叠结果整体
-   * 替换状态条目。监听器异常不得 veto 发布，整体兜底。
+   * 会话公告：批量折叠会话自身产生的内存日志（恢复会话携带全部自身历史；
+   * fork 子会话跳过父会话种子前缀，见下方折叠调用处），折叠结果整体替换
+   * 状态条目。监听器异常不得 veto 发布，整体兜底。
    */
   ctx.on('session/created', (session: Session) => {
     try {
@@ -439,20 +657,15 @@ export function apply(ctx: Context, config: Config): void {
       }
       const fold = createSessionFold(metaOf(session))
       folds.set(id, fold)
-      for (const event of session.events) {
-        const title = titleFromEvent(event)
-        if (title !== undefined) fold.title = title
-        const route = routeFromEvent(event)
-        if (route !== null) fold.route = route
-        const sample = sampleFromEvent(event, fold.route)
-        if (sample === null) continue
-        foldUsageSample(fold, sample)
-      }
+      // 只折叠会话自身的事件：fork 子会话日志前缀（inheritedEventCount 个种子
+      // 事件）的 usage 已计入父会话条目，整段折叠会重复计父会话历史
+      foldSessionEvents(fold, session.ownEvents())
       state.sessions[id] = foldToStored(fold)
       const t = fold.totals
       console.log(
         `[token-stats] session ${id} ready: history folded, model calls=${fold.requests}`
-        + (fold.requests > 0 ? ` in=${t.inputTokens} cacheR=${t.cacheReadTokens} cacheW=${t.cacheWriteTokens} out=${t.outputTokens}` : ''),
+        + (fold.requests > 0 ? ` in=${t.inputTokens} cacheR=${t.cacheReadTokens} cacheW=${t.cacheWriteTokens} out=${t.outputTokens}` : '')
+        + (session.inheritedEventCount > 0 ? ` (skipped ${session.inheritedEventCount} inherited events)` : ''),
       )
       if (fold.requests > 0) scheduleFlush()
     } catch (error) {
@@ -501,7 +714,9 @@ export function apply(ctx: Context, config: Config): void {
     isConcurrencySafe: () => true,
     async execute(args) {
       await backfillTitles()
-      const report = buildReport(state, {
+      const idFilter = args.sessionId?.trim()
+      if (idFilter !== undefined && idFilter.length > 0) requestMaterialize(idFilter)
+      const report = buildReport(fullState(), {
         days: args.days,
         sessionId: args.sessionId,
         limit: args.limit,
@@ -522,7 +737,11 @@ export function apply(ctx: Context, config: Config): void {
   }, 'token-stats:title-warmup')
 
   console.log(
-    `[token-stats] started: dir=${dir} trackedSessions=${Object.keys(state.sessions).length} logCalls=${logCalls} flushMs=${flushMs} api=${API_PREFIX}/report`
+    `[token-stats] started: dir=${dir} trackedSessions=${Object.keys(state.sessions).length}`
+    + ` archived=${archived.size} logCalls=${logCalls} flushMs=${flushMs}`
+    + ` finalizeOnStop=${config.finalizeOnStop !== false}`
+    + ` materializeMax=${materializeMaxBytes === 0 ? 'off' : `${materializeMaxBytes} bytes`}`
+    + ` api=${API_PREFIX}/report`
     + ` cost(deepseek=${costPlan.deepseekProvider}, local=[${costPlan.localProviders.join(',')}], kwh=${costPlan.localPricePerKwh}, w=${costPlan.localPowerWatts}, decodeTps=${costPlan.localDecodeTps}, prefillTps=${costPlan.localPrefillTps})`,
   )
 }

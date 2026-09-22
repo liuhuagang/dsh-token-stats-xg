@@ -17,10 +17,16 @@ export interface UsageRow {
   totalTokens: number
 }
 
-/** 费用估算（元）：DeepSeek 官网空闲时段价 + 本地电费 */
+/**
+ * 费用估算（元）：DeepSeek 官网空闲时段价 + 本地电费。
+ * remoteYuan = 若全部走远端的反事实费用；savedYuan = 折算节约
+ * （remoteYuan - totalYuan，机会成本口径，可为负）。
+ */
 export interface CostEstimate {
   deepseekYuan: number
   localYuan: number
+  remoteYuan: number
+  savedYuan: number
   totalYuan: number
 }
 

@@ -207,6 +207,11 @@ export function TokenStatsView(): ReactElement {
               value={fmtYuan(report.total.cost.totalYuan)}
               sub={`DeepSeek ${fmtYuan(report.total.cost.deepseekYuan)} · 本地电费 ${fmtYuan(report.total.cost.localYuan)}`}
             />
+            <Card
+              label="折算节约"
+              value={fmtYuan(report.total.cost.savedYuan)}
+              sub={`若全部走远端约 ${fmtYuan(report.total.cost.remoteYuan)}`}
+            />
           </div>
 
           <section className="tts-panel">
@@ -241,7 +246,7 @@ export function TokenStatsView(): ReactElement {
                         <td>{fmtTokens(row.usage.inputTokens + row.usage.cacheReadTokens + row.usage.cacheWriteTokens)}</td>
                         <td>{fmtTokens(row.usage.outputTokens)}</td>
                         <td>{fmtTokens(row.totalTokens)}</td>
-                        <td title={`DeepSeek ${fmtYuan(row.cost.deepseekYuan)} · 本地电费 ${fmtYuan(row.cost.localYuan)}`}>{fmtYuan(row.cost.totalYuan)}</td>
+                        <td title={`DeepSeek ${fmtYuan(row.cost.deepseekYuan)} · 本地电费 ${fmtYuan(row.cost.localYuan)} · 远端等价 ${fmtYuan(row.cost.remoteYuan)} · 折算节约 ${fmtYuan(row.cost.savedYuan)}`}>{fmtYuan(row.cost.totalYuan)}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -303,7 +308,7 @@ export function TokenStatsView(): ReactElement {
           </section>
 
           <div className="tts-footnote">
-            费用估算：DeepSeek 按官网空闲时段价（缓存命中 / 未命中分档，未计费模型除外）；本地按电费——输出与未命中输入折算 GPU 时间 × 功耗 × 电价，缓存读不计，不超过窗口内满载电费上限（参数可在插件配置中调整）
+            费用估算：DeepSeek 按官网空闲时段价（缓存命中 / 未命中分档，未计费模型除外）；本地按电费——输出与未命中输入折算 GPU 时间 × 功耗 × 电价，缓存读不计，不超过窗口内满载电费上限；折算节约 = 若全部走远端（本地 token 按同名 / 前缀映射模型官网价，未映射兜底 flash 价，均可配置）− 实际费用，机会成本口径
           </div>
         </>
       )}

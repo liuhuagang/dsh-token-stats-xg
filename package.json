@@ -3,7 +3,7 @@
   "version": "1.2.1",
   "private": true,
   "type": "module",
-  "description": "DSH plugin: cross-session token usage monitoring (input/output/cache) with live session/event listener, durable state, a token_stats query tool, a Web dashboard tab (conversation.view), and cost estimation (DeepSeek official idle-time pricing + local electricity).",
+  "description": "DSH plugin: cross-session token usage monitoring (input/output/cache) with live session/event listener, durable state, a token_stats query tool, a Web dashboard tab (conversation.view), and cost estimation (DeepSeek official idle-time pricing + local electricity) with hypothetical remote-cost savings.",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
   "exports": {

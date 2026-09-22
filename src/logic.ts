@@ -16,7 +16,7 @@
  * 无损的；折叠函数对"批量重放整段日志"与"实时单条事件"两种用法完全一致。
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /** Token 用量桶（五个字段恒在；缺失字段归一化为 0） */
@@ -194,6 +194,18 @@ export interface CostPlan {
   localProviders: string[]
   /** DeepSeek 价目表（模型名 → 单价；内置默认 + 配置覆盖） */
   deepseekPrices: Record<string, DeepseekModelPrice>
+  /**
+   * 本地模型名 → 远端价目表模型名映射。键按**前缀匹配**（精确命中优先，
+   * 其次最长前缀），一条 `'Qwen3.8-27B': 'deepseek-v4-flash'` 即可覆盖
+   * `Qwen3.8-27B-UD-IQ4_XS-176K-Text-MTP` 等量化变体；未命中映射时按
+   * 同名（模型名本身）查价目表。
+   */
+  localToRemoteModel: Record<string, string>
+  /**
+   * 未映射（映射与同名都查不到价目表）本地模型的兜底远端计费模型名；
+   * null = 不兜底（等价远端费用 0）。
+   */
+  localFallbackRemoteModel: string | null
   /** 本地电价（元/千瓦时） */
   localPricePerKwh: number
   /** 本地整机功耗（瓦） */
@@ -210,12 +222,18 @@ export interface CostPlan {
  * 本地电费口径：只对真正消耗 GPU 算力的 token 折算时间——输出（decode）
  * 与未命中输入（prefill）按各自吞吐折算，缓存读/写近似不计（从 KV 缓存
  * 拉取，能耗可忽略）；总电费不超过"窗口天数 × 24h 满载"的物理上限。
+ *
+ * 等价远端兜底：本地量化模型名（如 Qwen3.8-27B-UD-IQ4_XS-…）查不到价目表
+ * 时默认按 deepseek-v4-flash 官网价估算（可配置覆盖或关闭）——"本地跑 vs
+ * 远端 API"对比的保守参考。
  */
 export function defaultCostPlan(): CostPlan {
   return {
     deepseekProvider: 'deepseek-official',
-    localProviders: ['llama-local'],
+    localProviders: ['llama-local', 'sglang-local', 'vllm-local', 'ollama'],
     deepseekPrices: { ...DEFAULT_DEEPSEEK_PRICES },
+    localToRemoteModel: {},
+    localFallbackRemoteModel: 'deepseek-v4-flash',
     localPricePerKwh: 0.6,
     localPowerWatts: 600,
     localDecodeTps: 50,
@@ -223,36 +241,82 @@ export function defaultCostPlan(): CostPlan {
   }
 }
 
-/** 费用估算结果（元） */
+/**
+ * 费用估算结果（元）。
+ *
+ * 语义：`totalYuan` = 实际费用（DeepSeek API + 本地电费）；`remoteYuan` =
+ * "若全部走远端"的反事实费用（DeepSeek 路由即其本身费用，本地路由按同名/
+ * 映射模型官网价估算）；`savedYuan` = 折算节约 = `remoteYuan - totalYuan`
+ * （仅本地路由贡献，可为负——本地部署比远端更贵的信号）。
+ */
 export interface CostEstimate {
   /** DeepSeek 官方 API 估算费用 */
   deepseekYuan: number
   /** 本地模型电费估算 */
   localYuan: number
-  /** 合计 */
+  /** 等价远端费用：本地 token 若走 DeepSeek API 的假设费用（含 DeepSeek 路由本身） */
+  remoteYuan: number
+  /** 折算节约：remoteYuan - totalYuan（机会成本口径，非现金节约） */
+  savedYuan: number
+  /** 合计（实际费用） */
   totalYuan: number
 }
 
 /** 零费用 */
 export function zeroCost(): CostEstimate {
-  return { deepseekYuan: 0, localYuan: 0, totalYuan: 0 }
+  return { deepseekYuan: 0, localYuan: 0, remoteYuan: 0, savedYuan: 0, totalYuan: 0 }
 }
 
-/** 费用累加（与 addUsage 对称） */
+/** 费用累加（与 addUsage 对称）；totalYuan 恒 = deepseek + local，不重复累加 */
 export function addCost(a: CostEstimate, b: CostEstimate): CostEstimate {
   const deepseekYuan = a.deepseekYuan + b.deepseekYuan
   const localYuan = a.localYuan + b.localYuan
-  return { deepseekYuan, localYuan, totalYuan: deepseekYuan + localYuan }
+  return {
+    deepseekYuan,
+    localYuan,
+    remoteYuan: a.remoteYuan + b.remoteYuan,
+    savedYuan: a.savedYuan + b.savedYuan,
+    totalYuan: deepseekYuan + localYuan,
+  }
+}
+
+/** 按价目表计 DeepSeek 费用（命中/未命中分档，缓存写归未命中） */
+function remoteFee(usage: UsageBuckets, price: DeepseekModelPrice): number {
+  const miss = (usage.inputTokens + usage.cacheWriteTokens) / 1e6 * price.inputMiss
+  const hit = usage.cacheReadTokens / 1e6 * price.inputHit
+  const out = usage.outputTokens / 1e6 * price.output
+  return miss + hit + out
+}
+
+/**
+ * 解析本地模型名的远端计费模型：先查 localToRemoteModel（精确命中优先，
+ * 其次最长前缀匹配），未命中则回退同名（模型名本身）。返回值仅用于查
+ * 价目表，价目表查不到时由调用方决定兜底。
+ */
+export function remoteModelOf(plan: CostPlan, model: string): string {
+  const exact = plan.localToRemoteModel[model]
+  if (exact !== undefined) return exact
+  let bestKey: string | null = null
+  for (const key of Object.keys(plan.localToRemoteModel)) {
+    if (key.length === 0) continue
+    if (model.startsWith(key) && (bestKey === null || key.length > bestKey.length)) {
+      bestKey = key
+    }
+  }
+  return bestKey === null ? model : plan.localToRemoteModel[bestKey]!
 }
 
 /**
  * 单路由费用估算（对聚合 usage 直接计算——费用是 token 数的线性函数，
  * 与逐样本累加等价；物理上限兜底由 buildReport 统一施加）。
  *
- * 归属规则：provider 匹配 deepseekProvider → 按价目表（命中/未命中分档，
- * 缓存写归未命中；模型不在价目表内不计费）；provider 在 localProviders →
- * 电费 = (输出 ÷ decode 吞吐 + 未命中输入 ÷ prefill 吞吐) × 功耗 × 电价，
- * 缓存读/写不计（KV 缓存拉取能耗可忽略）；其余（未知/未配置计费）→ 零费用。
+ * 归属规则：provider 匹配 deepseekProvider → 按价目表计费（模型不在价目表
+ * 内不计费），该路由本身就是远端费用（remoteYuan = deepseekYuan，节约为 0）；
+ * provider 在 localProviders → 电费 = (输出 ÷ decode 吞吐 + 未命中输入 ÷
+ * prefill 吞吐) × 功耗 × 电价（缓存读/写不计），并额外估算"若走远端"的
+ * 等价费用（按 localToRemoteModel 前缀映射或同名模型查价目表，仍查不到
+ * 时按 localFallbackRemoteModel 兜底，再查不到为 0），折算节约 =
+ * 等价远端费用 − 电费（可为负）；其余（未知/未配置计费）→ 零费用。
  */
 export function estimateRouteCost(route: string, usage: UsageBuckets, plan: CostPlan): CostEstimate {
   const slash = route.indexOf('/')
@@ -262,18 +326,27 @@ export function estimateRouteCost(route: string, usage: UsageBuckets, plan: Cost
   if (provider === plan.deepseekProvider) {
     const price = plan.deepseekPrices[model]
     if (price === undefined) return zeroCost()
-    const miss = (usage.inputTokens + usage.cacheWriteTokens) / 1e6 * price.inputMiss
-    const hit = usage.cacheReadTokens / 1e6 * price.inputHit
-    const out = usage.outputTokens / 1e6 * price.output
-    const totalYuan = miss + hit + out
-    return { deepseekYuan: totalYuan, localYuan: 0, totalYuan }
+    const totalYuan = remoteFee(usage, price)
+    return { deepseekYuan: totalYuan, localYuan: 0, remoteYuan: totalYuan, savedYuan: 0, totalYuan }
   }
   if (plan.localProviders.includes(provider)) {
     const seconds = usage.outputTokens / plan.localDecodeTps
       + (usage.inputTokens + usage.cacheWriteTokens) / plan.localPrefillTps
     const kwh = seconds / 3600 * plan.localPowerWatts / 1000
-    const totalYuan = kwh * plan.localPricePerKwh
-    return { deepseekYuan: 0, localYuan: totalYuan, totalYuan }
+    const localYuan = kwh * plan.localPricePerKwh
+    const remoteModel = remoteModelOf(plan, model)
+    let price = plan.deepseekPrices[remoteModel]
+    if (price === undefined && plan.localFallbackRemoteModel !== null) {
+      price = plan.deepseekPrices[plan.localFallbackRemoteModel]
+    }
+    const remoteYuan = price === undefined ? 0 : remoteFee(usage, price)
+    return {
+      deepseekYuan: 0,
+      localYuan,
+      remoteYuan,
+      savedYuan: remoteYuan - localYuan,
+      totalYuan: localYuan,
+    }
   }
   return zeroCost()
 }
@@ -360,6 +433,27 @@ export function foldUsageSample(fold: SessionFold, sample: UsageSample): void {
   fold.last = { turn: sample.turn, step: sample.step, time: sample.time, route: sample.route, buckets: sample.usage }
 }
 
+/**
+ * 批量折叠一段会话日志到会话状态（session/created 公告重放；原地修改 fold）。
+ *
+ * 逐事件推进 title / route / usage，顺序语义与实时事件流完全一致（重放幂等：
+ * 同步骤样本替换、新步骤才计请求）。调用方负责传入**该会话自身产生的事件**：
+ * fork 继承前缀的子会话（DSH `Session.inheritedEventCount` > 0）必须传
+ * `session.ownEvents()`（继承前缀的 usage 属于父会话条目，整段折叠会把父
+ * 会话历史重复计入本会话与全部聚合行）。普通/恢复会话前缀为 0，整段即自身。
+ */
+export function foldSessionEvents(fold: SessionFold, events: readonly FoldableEvent[]): void {
+  for (const event of events) {
+    const title = titleFromEvent(event)
+    if (title !== undefined) fold.title = title
+    const route = routeFromEvent(event)
+    if (route !== null) fold.route = route
+    const sample = sampleFromEvent(event, fold.route)
+    if (sample === null) continue
+    foldUsageSample(fold, sample)
+  }
+}
+
 /** 从日桶中减去一个样本的用量（请求数由 adjustDayRequest/adjustRouteRequest 维护） */
 function removeSample(byDay: Record<string, DayAgg>, time: number, route: RouteKey | null, usage: UsageBuckets): void {
   const day = dayKey(time)
@@ -442,7 +536,7 @@ export function foldToStored(fold: SessionFold): StoredSession {
 /**
  * 从一条会话事件提取 usage 样本（无样本返回 null）。
  *
- * 事件来源：批量重放（session.events 全量）或实时（session/event）。
+ * 事件来源：批量重放（session.snapshotEvents() 全量）或实时（session/event）。
  * 路由归属：assistant/message 用 message.source（该消息的权威模型来源）；
  * chunk 样本用 `routeAt`（调用方维护的最近路由，来自 request/context 或
  * request/header）。
@@ -800,7 +894,8 @@ export function buildReport(state: TokenStatsState, opts: ReportOptions): StatsR
   for (const row of byRoute) totalCost = addCost(totalCost, row.cost)
 
   // 物理上限兜底：有限窗口下本地电费不超过"窗口天数 × 24h 满载"电费；
-  // 超出时按比例分摊到各本地路由/日/会话（DeepSeek 费用不动）。
+  // 超出时按比例分摊到各本地路由/日/会话（DeepSeek 费用不动；等价远端费用
+  // 是 token 的线性函数，不受上限影响，按比例分摊后重算折算节约）。
   let localScale = 1
   if (days !== null && totalCost.localYuan > 0) {
     const cap = days * 24 * costPlan.localPowerWatts / 1000 * costPlan.localPricePerKwh
@@ -810,7 +905,13 @@ export function buildReport(state: TokenStatsState, opts: ReportOptions): StatsR
     const applyLocal = (c: CostEstimate): CostEstimate => {
       if (c.localYuan === 0) return c
       const localYuan = c.localYuan * localScale
-      return { deepseekYuan: c.deepseekYuan, localYuan, totalYuan: c.deepseekYuan + localYuan }
+      return {
+        deepseekYuan: c.deepseekYuan,
+        localYuan,
+        remoteYuan: c.remoteYuan,
+        savedYuan: c.remoteYuan - localYuan,
+        totalYuan: c.deepseekYuan + localYuan,
+      }
     }
     totalCost = applyLocal(totalCost)
     for (const row of byRoute) row.cost = applyLocal(row.cost)
@@ -906,8 +1007,10 @@ export function renderReport(report: StatsReport): string {
   const c = t.cost
   lines.push(
     `估算费用 ${fmtYuan(c.totalYuan)}`
-    + `（DeepSeek API ${fmtYuan(c.deepseekYuan)} · 本地电费 ${fmtYuan(c.localYuan)}，`
-    + '低估口径：DeepSeek 官网空闲时段价、本地按 GPU 负载折算电费且不超过满载上限）',
+    + `（实际：DeepSeek API ${fmtYuan(c.deepseekYuan)} · 本地电费 ${fmtYuan(c.localYuan)}；`
+    + `若全部走远端约 ${fmtYuan(c.remoteYuan)}，折算节约 ${fmtYuan(c.savedYuan)}。`
+    + '低估口径：DeepSeek 官网空闲时段价、本地按 GPU 负载折算电费且不超过满载上限、'
+    + '远端等价按同名/前缀映射模型（未映射兜底可配置）计）',
   )
 
   if (report.byRoute.length > 0) {
@@ -1007,4 +1110,136 @@ export function hourlyHistogram(
     bucket.totalTokens = totalTokens(bucket.usage)
   }
   return buckets
+}
+
+// ---------- 归档层（分层存储：热状态 + 只追加归档） ----------
+//
+// 性能模型：token-stats.json 只保存"本次进程内活跃/公告过的会话"（热层），
+// 每次防抖落盘只写热层，体积与历史总量无关；会话在进程停止（finalizeOnStop）
+// 时一次性追加进 archive.jsonl（每会话一行，之后不再改动）。查询路径把热层与
+// 归档合并成"全量会话视图"，历史可完整追溯（durable 会话日志始终是最底层
+// source of truth，归档只是派生缓存，会话再次公告时可整体重建，不会丢/重）。
+
+export const ARCHIVE_VERSION = 1
+
+/** 归档文件路径：<dir>/archive.jsonl（追加写；同 id 重复行以最后一行胜出） */
+export function archiveFilePath(dir: string): string {
+  return join(dir, 'archive.jsonl')
+}
+
+/** 归档行内容 */
+export interface ArchiveLine {
+  v: number
+  id: string
+  entry: StoredSession
+  archivedAt: number
+}
+
+/** 序列化一行归档记录（单行 JSON，不换行） */
+export function encodeArchiveLine(id: string, entry: StoredSession, archivedAt: number): string {
+  return JSON.stringify({ v: ARCHIVE_VERSION, id, entry, archivedAt } as ArchiveLine)
+}
+
+/** 解析一行归档记录；空白/损坏/版本不符/条目非法返回 null */
+export function parseArchiveLine(line: string): { id: string; entry: StoredSession; archivedAt: number } | null {
+  const text = line.trim()
+  if (text.length === 0) return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return null
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null
+  const p = parsed as Record<string, unknown>
+  if (p['v'] !== ARCHIVE_VERSION) return null
+  const id = p['id']
+  if (typeof id !== 'string' || id.length === 0) return null
+  const entry = sanitizeStoredSession(p['entry'])
+  if (entry === null) return null
+  return { id, entry, archivedAt: isFiniteNumber(p['archivedAt']) ? p['archivedAt'] : 0 }
+}
+
+/** 统计归档文本：总行数（合法行）与重复 id 行数，用于压实判定 */
+export function countArchiveDuplicates(text: string): { lines: number; duplicateLines: number } {
+  const seen = new Set<string>()
+  let lines = 0
+  let duplicateLines = 0
+  for (const line of text.split('\n')) {
+    const parsed = parseArchiveLine(line)
+    if (parsed === null) continue
+    lines += 1
+    if (seen.has(parsed.id)) {
+      duplicateLines += 1
+    } else {
+      seen.add(parsed.id)
+    }
+  }
+  return { lines, duplicateLines }
+}
+
+/** 归档文本 → 按会话去重的 Map（文件顺序，同 id 后写胜出） */
+export function loadArchiveText(text: string): Map<string, StoredSession> {
+  const map = new Map<string, StoredSession>()
+  for (const line of text.split('\n')) {
+    const parsed = parseArchiveLine(line)
+    if (parsed === null) continue
+    map.set(parsed.id, parsed.entry)
+  }
+  return map
+}
+
+/** Map → 归档文本（按 id 字典序，确定性输出；末尾换行） */
+export function serializeArchive(map: Map<string, StoredSession>, archivedAt: number): string {
+  const lines: string[] = []
+  for (const id of [...map.keys()].sort()) {
+    const entry = map.get(id)
+    if (entry === undefined) continue
+    lines.push(encodeArchiveLine(id, entry, archivedAt))
+  }
+  return lines.length > 0 ? `${lines.join('\n')}\n` : ''
+}
+
+/** 读取归档文件并统计（不存在/损坏按空处理） */
+export function readArchiveFile(file: string): { map: Map<string, StoredSession>; lines: number; duplicateLines: number } {
+  let raw: string
+  try {
+    raw = readFileSync(file, 'utf8')
+  } catch {
+    return { map: new Map<string, StoredSession>(), lines: 0, duplicateLines: 0 }
+  }
+  const { lines, duplicateLines } = countArchiveDuplicates(raw)
+  return { map: loadArchiveText(raw), lines, duplicateLines }
+}
+
+/** 全量重写归档（去重压实；先写临时文件再原子改名） */
+export function rewriteArchive(file: string, map: Map<string, StoredSession>, archivedAt: number): void {
+  mkdirSync(join(file, '..'), { recursive: true })
+  const tmp = `${file}.tmp`
+  writeFileSync(tmp, serializeArchive(map, archivedAt), 'utf8')
+  renameSync(tmp, file)
+}
+
+/** 追加一条会话归档记录（只追加不改写已有行） */
+export function appendArchiveLine(file: string, id: string, entry: StoredSession, archivedAt: number): void {
+  mkdirSync(join(file, '..'), { recursive: true })
+  appendFileSync(file, `${encodeArchiveLine(id, entry, archivedAt)}\n`, 'utf8')
+}
+
+/**
+ * 构建"全量会话视图"：热层优先，归档补齐缺失会话。
+ *
+ * 仅做引用级合并（不深拷贝条目），供 buildReport 等只读查询使用；
+ * 视图与"插件持续运行"语义一致——热层条目（本次进程公告/活跃）覆盖归档
+ * 中同 id 的上一次终态，避免重复计数。
+ */
+export function mergedSessions(
+  hot: Record<string, StoredSession>,
+  archived: Map<string, StoredSession>,
+): Record<string, StoredSession> {
+  const merged: Record<string, StoredSession> = { ...hot }
+  for (const [id, entry] of archived) {
+    if (!(id in merged)) merged[id] = entry
+  }
+  return merged
 }
