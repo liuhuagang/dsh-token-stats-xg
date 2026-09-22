@@ -1,6 +1,6 @@
 {
   "name": "dsh-token-stats-xg",
-  "version": "1.2.1",
+  "version": "1.6.2",
   "private": true,
   "type": "module",
   "description": "DSH plugin: cross-session token usage monitoring (input/output/cache) with live session/event listener, durable state, a token_stats query tool, a Web dashboard tab (conversation.view), and cost estimation (DeepSeek official idle-time pricing + local electricity) with hypothetical remote-cost savings.",
